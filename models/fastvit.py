@@ -60,19 +60,69 @@ default_cfgs = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Helpers for 2D / 3D switching
+# ---------------------------------------------------------------------------
+
+def _get_conv(conv_type: str):
+    return nn.Conv3d if conv_type == "3d" else nn.Conv2d
+
+
+def _get_norm(conv_type: str):
+    return nn.BatchNorm3d if conv_type == "3d" else nn.BatchNorm2d
+
+
+def _get_pool(conv_type: str):
+    return nn.AdaptiveAvgPool3d if conv_type == "3d" else nn.AdaptiveAvgPool2d
+
+
+def _scale_shape(dim: int, conv_type: str):
+    """Return layer-scale parameter shape for the given conv dimensionality."""
+    return (dim, 1, 1, 1) if conv_type == "3d" else (dim, 1, 1)
+
+
+def _fuse_conv_bn(seq: nn.Sequential) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fuse a Conv+BN Sequential into (weight, bias). Works for 2D and 3D."""
+    conv, bn = seq[0], seq[1]
+    std = (bn.running_var + bn.eps).sqrt()
+    extra_dims = conv.weight.dim() - 1  # spatial dims + in_ch dim
+    t = (bn.weight / std).reshape(-1, *([1] * extra_dims))
+    fused_weight = conv.weight * t
+    fused_bias = bn.bias - bn.running_mean * bn.weight / std
+    return fused_weight, fused_bias
+
+
+# ---------------------------------------------------------------------------
+# Convolutional stem
+# ---------------------------------------------------------------------------
+
 def convolutional_stem(
-    in_channels: int, out_channels: int, inference_mode: bool = False
+    in_channels: int,
+    out_channels: int,
+    inference_mode: bool = False,
+    conv_type: str = "2d",
 ) -> nn.Sequential:
-    """Build convolutional stem with MobileOne blocks.
+    """Build convolutional stem.
 
-    Args:
-        in_channels: Number of input channels.
-        out_channels: Number of output channels.
-        inference_mode: Flag to instantiate model in inference mode. Default: ``False``
-
-    Returns:
-        nn.Sequential object with stem elements.
+    For 2D uses MobileOneBlock (with structural reparameterization).
+    For 3D uses plain Conv3d+BN+GELU blocks.
     """
+    if conv_type == "3d":
+        Conv = nn.Conv3d
+        BN = nn.BatchNorm3d
+        return nn.Sequential(
+            Conv(in_channels, out_channels, 3, stride=2, padding=1, bias=False),
+            BN(out_channels),
+            nn.GELU(),
+            Conv(out_channels, out_channels, 3, stride=2, padding=1,
+                 groups=out_channels, bias=False),
+            BN(out_channels),
+            nn.GELU(),
+            Conv(out_channels, out_channels, 1, bias=False),
+            BN(out_channels),
+            nn.GELU(),
+        )
+
     return nn.Sequential(
         MobileOneBlock(
             in_channels=in_channels,
@@ -110,6 +160,10 @@ def convolutional_stem(
     )
 
 
+# ---------------------------------------------------------------------------
+# MHSA – handles both 4-D (B,C,H,W) and 5-D (B,C,D,H,W) tensors
+# ---------------------------------------------------------------------------
+
 class MHSA(nn.Module):
     """Multi-headed Self Attention module.
 
@@ -125,15 +179,6 @@ class MHSA(nn.Module):
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
     ) -> None:
-        """Build MHSA module that can handle 3D or 4D input tensors.
-
-        Args:
-            dim: Number of embedding dimensions.
-            head_dim: Number of hidden dimensions per head. Default: ``32``
-            qkv_bias: Use bias or not. Default: ``False``
-            attn_drop: Dropout rate for attention tensor.
-            proj_drop: Dropout rate for projection tensor.
-        """
         super().__init__()
         assert dim % head_dim == 0, "dim should be divisible by head_dim"
         self.head_dim = head_dim
@@ -147,33 +192,36 @@ class MHSA(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
-        B, C, H, W = shape
-        N = H * W
-        if len(shape) == 4:
-            x = torch.flatten(x, start_dim=2).transpose(-2, -1)  # (B, N, C)
+        B, C = shape[0], shape[1]
+        N = 1
+        for s in shape[2:]:
+            N *= s
+
+        x_flat = torch.flatten(x, start_dim=2).transpose(-2, -1)  # (B, N, C)
         qkv = (
-            self.qkv(x)
+            self.qkv(x_flat)
             .reshape(B, N, 3, self.num_heads, self.head_dim)
             .permute(2, 0, 3, 1, 4)
         )
-        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv.unbind(0)
 
-        # trick here to make q@k.t more stable
         attn = (q * self.scale) @ k.transpose(-2, -1)
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        if len(shape) == 4:
-            x = x.transpose(-2, -1).reshape(B, C, H, W)
+        x_out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x_out = self.proj(x_out)
+        x_out = self.proj_drop(x_out)
+        x_out = x_out.transpose(-2, -1).reshape(shape)
+        return x_out
 
-        return x
 
+# ---------------------------------------------------------------------------
+# PatchEmbed
+# ---------------------------------------------------------------------------
 
 class PatchEmbed(nn.Module):
-    """Convolutional patch embedding layer."""
+    """Convolutional patch embedding layer (2D or 3D)."""
 
     def __init__(
         self,
@@ -182,54 +230,66 @@ class PatchEmbed(nn.Module):
         in_channels: int,
         embed_dim: int,
         inference_mode: bool = False,
+        conv_type: str = "2d",
     ) -> None:
-        """Build patch embedding layer.
-
-        Args:
-            patch_size: Patch size for embedding computation.
-            stride: Stride for convolutional embedding layer.
-            in_channels: Number of channels of input tensor.
-            embed_dim: Number of embedding dimensions.
-            inference_mode: Flag to instantiate model in inference mode. Default: ``False``
-        """
         super().__init__()
-        block = list()
-        block.append(
-            ReparamLargeKernelConv(
-                in_channels=in_channels,
-                out_channels=embed_dim,
-                kernel_size=patch_size,
-                stride=stride,
-                groups=in_channels,
-                small_kernel=3,
-                inference_mode=inference_mode,
+
+        if conv_type == "3d":
+            Conv = nn.Conv3d
+            BN = nn.BatchNorm3d
+            padding = patch_size // 2
+            self.proj = nn.Sequential(
+                Conv(in_channels, embed_dim, patch_size, stride=stride,
+                     padding=padding, groups=in_channels, bias=False),
+                BN(embed_dim),
+                nn.GELU(),
+                Conv(embed_dim, embed_dim, 1, bias=False),
+                BN(embed_dim),
+                nn.GELU(),
             )
-        )
-        block.append(
-            MobileOneBlock(
-                in_channels=embed_dim,
-                out_channels=embed_dim,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-                groups=1,
-                inference_mode=inference_mode,
-                use_se=False,
-                num_conv_branches=1,
+        else:
+            block = list()
+            block.append(
+                ReparamLargeKernelConv(
+                    in_channels=in_channels,
+                    out_channels=embed_dim,
+                    kernel_size=patch_size,
+                    stride=stride,
+                    groups=in_channels,
+                    small_kernel=3,
+                    inference_mode=inference_mode,
+                )
             )
-        )
-        self.proj = nn.Sequential(*block)
+            block.append(
+                MobileOneBlock(
+                    in_channels=embed_dim,
+                    out_channels=embed_dim,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    groups=1,
+                    inference_mode=inference_mode,
+                    use_se=False,
+                    num_conv_branches=1,
+                )
+            )
+            self.proj = nn.Sequential(*block)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)
         return x
 
 
+# ---------------------------------------------------------------------------
+# RepMixer
+# ---------------------------------------------------------------------------
+
 class RepMixer(nn.Module):
-    """Reparameterizable token mixer.
+    """Reparameterizable token mixer (2D or 3D).
 
     For more details, please refer to our paper:
-    `FastViT: A Fast Hybrid Vision Transformer using Structural Reparameterization <https://arxiv.org/pdf/2303.14189.pdf>`_
+    `FastViT: A Fast Hybrid Vision Transformer using Structural Reparameterization
+    <https://arxiv.org/pdf/2303.14189.pdf>`_
     """
 
     def __init__(
@@ -239,23 +299,18 @@ class RepMixer(nn.Module):
         use_layer_scale=True,
         layer_scale_init_value=1e-5,
         inference_mode: bool = False,
+        conv_type: str = "2d",
     ):
-        """Build RepMixer Module.
-
-        Args:
-            dim: Input feature map dimension. :math:`C_{in}` from an expected input of size :math:`(B, C_{in}, H, W)`.
-            kernel_size: Kernel size for spatial mixing. Default: 3
-            use_layer_scale: If True, learnable layer scale is used. Default: ``True``
-            layer_scale_init_value: Initial value for layer scale. Default: 1e-5
-            inference_mode: If True, instantiates model in inference mode. Default: ``False``
-        """
         super().__init__()
         self.dim = dim
         self.kernel_size = kernel_size
         self.inference_mode = inference_mode
+        self.conv_type = conv_type
+
+        Conv = _get_conv(conv_type)
 
         if inference_mode:
-            self.reparam_conv = nn.Conv2d(
+            self.reparam_conv = Conv(
                 in_channels=self.dim,
                 out_channels=self.dim,
                 kernel_size=self.kernel_size,
@@ -265,28 +320,43 @@ class RepMixer(nn.Module):
                 bias=True,
             )
         else:
-            self.norm = MobileOneBlock(
-                dim,
-                dim,
-                kernel_size,
-                padding=kernel_size // 2,
-                groups=dim,
-                use_act=False,
-                use_scale_branch=False,
-                num_conv_branches=0,
-            )
-            self.mixer = MobileOneBlock(
-                dim,
-                dim,
-                kernel_size,
-                padding=kernel_size // 2,
-                groups=dim,
-                use_act=False,
-            )
+            if conv_type == "3d":
+                BN = nn.BatchNorm3d
+                self.norm = nn.Sequential(
+                    Conv(dim, dim, kernel_size, padding=kernel_size // 2,
+                         groups=dim, bias=False),
+                    BN(dim),
+                )
+                self.mixer = nn.Sequential(
+                    Conv(dim, dim, kernel_size, padding=kernel_size // 2,
+                         groups=dim, bias=False),
+                    BN(dim),
+                )
+            else:
+                self.norm = MobileOneBlock(
+                    dim,
+                    dim,
+                    kernel_size,
+                    padding=kernel_size // 2,
+                    groups=dim,
+                    use_act=False,
+                    use_scale_branch=False,
+                    num_conv_branches=0,
+                )
+                self.mixer = MobileOneBlock(
+                    dim,
+                    dim,
+                    kernel_size,
+                    padding=kernel_size // 2,
+                    groups=dim,
+                    use_act=False,
+                )
+
             self.use_layer_scale = use_layer_scale
             if use_layer_scale:
                 self.layer_scale = nn.Parameter(
-                    layer_scale_init_value * torch.ones((dim, 1, 1)), requires_grad=True
+                    layer_scale_init_value * torch.ones(_scale_shape(dim, conv_type)),
+                    requires_grad=True,
                 )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -301,12 +371,23 @@ class RepMixer(nn.Module):
             return x
 
     def reparameterize(self) -> None:
-        """Reparameterize mixer and norm into a single
-        convolutional layer for efficient inference.
-        """
+        """Reparameterize mixer and norm into a single conv for efficient inference."""
         if self.inference_mode:
             return
 
+        if self.conv_type == "3d":
+            self._reparameterize_3d()
+        else:
+            self._reparameterize_2d()
+
+        for para in self.parameters():
+            para.detach_()
+        self.__delattr__("mixer")
+        self.__delattr__("norm")
+        if self.use_layer_scale:
+            self.__delattr__("layer_scale")
+
+    def _reparameterize_2d(self) -> None:
         self.mixer.reparameterize()
         self.norm.reparameterize()
 
@@ -337,16 +418,44 @@ class RepMixer(nn.Module):
         self.reparam_conv.weight.data = w
         self.reparam_conv.bias.data = b
 
-        for para in self.parameters():
-            para.detach_()
-        self.__delattr__("mixer")
-        self.__delattr__("norm")
-        if self.use_layer_scale:
-            self.__delattr__("layer_scale")
+    def _reparameterize_3d(self) -> None:
+        w_mixer, b_mixer = _fuse_conv_bn(self.mixer)
+        w_norm, b_norm = _fuse_conv_bn(self.norm)
 
+        # Build 3D identity tensor (depthwise: groups=dim, input_dim=1)
+        input_dim = self.dim // self.dim  # 1 since groups == dim
+        id_tensor = torch.zeros_like(w_mixer)
+        c = self.kernel_size // 2
+        for i in range(self.dim):
+            id_tensor[i, i % input_dim, c, c, c] = 1
+
+        if self.use_layer_scale:
+            ls = self.layer_scale  # shape (dim, 1, 1, 1)
+            w = id_tensor + ls * (w_mixer - w_norm)
+            b = ls.view(-1) * (b_mixer - b_norm)
+        else:
+            w = id_tensor + w_mixer - w_norm
+            b = b_mixer - b_norm
+
+        self.reparam_conv = nn.Conv3d(
+            in_channels=self.dim,
+            out_channels=self.dim,
+            kernel_size=self.kernel_size,
+            stride=1,
+            padding=self.kernel_size // 2,
+            groups=self.dim,
+            bias=True,
+        )
+        self.reparam_conv.weight.data = w
+        self.reparam_conv.bias.data = b
+
+
+# ---------------------------------------------------------------------------
+# ConvFFN
+# ---------------------------------------------------------------------------
 
 class ConvFFN(nn.Module):
-    """Convolutional FFN Module."""
+    """Convolutional FFN Module (2D or 3D)."""
 
     def __init__(
         self,
@@ -355,40 +464,39 @@ class ConvFFN(nn.Module):
         out_channels: Optional[int] = None,
         act_layer: nn.Module = nn.GELU,
         drop: float = 0.0,
+        conv_type: str = "2d",
     ) -> None:
-        """Build convolutional FFN module.
-
-        Args:
-            in_channels: Number of input channels.
-            hidden_channels: Number of channels after expansion. Default: None
-            out_channels: Number of output channels. Default: None
-            act_layer: Activation layer. Default: ``GELU``
-            drop: Dropout rate. Default: ``0.0``.
-        """
         super().__init__()
         out_channels = out_channels or in_channels
         hidden_channels = hidden_channels or in_channels
+
+        Conv = _get_conv(conv_type)
+        BN = _get_norm(conv_type)
+        # Use smaller depthwise kernel for 3D to keep param count reasonable
+        dw_kernel = 3 if conv_type == "3d" else 7
+        dw_padding = dw_kernel // 2
+
         self.conv = nn.Sequential()
         self.conv.add_module(
             "conv",
-            nn.Conv2d(
+            Conv(
                 in_channels=in_channels,
                 out_channels=out_channels,
-                kernel_size=7,
-                padding=3,
+                kernel_size=dw_kernel,
+                padding=dw_padding,
                 groups=in_channels,
                 bias=False,
             ),
         )
-        self.conv.add_module("bn", nn.BatchNorm2d(num_features=out_channels))
-        self.fc1 = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
+        self.conv.add_module("bn", BN(num_features=out_channels))
+        self.fc1 = Conv(in_channels, hidden_channels, kernel_size=1)
         self.act = act_layer()
-        self.fc2 = nn.Conv2d(hidden_channels, out_channels, kernel_size=1)
+        self.fc2 = Conv(hidden_channels, out_channels, kernel_size=1)
         self.drop = nn.Dropout(drop)
         self.apply(self._init_weights)
 
     def _init_weights(self, m: nn.Module) -> None:
-        if isinstance(m, nn.Conv2d):
+        if isinstance(m, (nn.Conv2d, nn.Conv3d)):
             trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
@@ -403,67 +511,89 @@ class ConvFFN(nn.Module):
         return x
 
 
+# ---------------------------------------------------------------------------
+# RepCPE
+# ---------------------------------------------------------------------------
+
 class RepCPE(nn.Module):
-    """Implementation of conditional positional encoding.
+    """Implementation of conditional positional encoding (2D or 3D).
 
     For more details refer to paper:
-    `Conditional Positional Encodings for Vision Transformers <https://arxiv.org/pdf/2102.10882.pdf>`_
-
-    In our implementation, we can reparameterize this module to eliminate a skip connection.
+    `Conditional Positional Encodings for Vision Transformers
+    <https://arxiv.org/pdf/2102.10882.pdf>`_
     """
 
     def __init__(
         self,
         in_channels: int,
         embed_dim: int = 768,
-        spatial_shape: Union[int, Tuple[int, int]] = (7, 7),
+        spatial_shape: Union[int, Tuple] = (7, 7),
         inference_mode=False,
+        conv_type: str = "2d",
     ) -> None:
-        """Build reparameterizable conditional positional encoding
-
-        Args:
-            in_channels: Number of input channels.
-            embed_dim: Number of embedding dimensions. Default: 768
-            spatial_shape: Spatial shape of kernel for positional encoding. Default: (7, 7)
-            inference_mode: Flag to instantiate block in inference mode. Default: ``False``
-        """
         super(RepCPE, self).__init__()
-        if isinstance(spatial_shape, int):
-            spatial_shape = tuple([spatial_shape] * 2)
-        assert isinstance(spatial_shape, Tuple), (
-            f'"spatial_shape" must by a sequence or int, '
-            f"get {type(spatial_shape)} instead."
-        )
-        assert len(spatial_shape) == 2, (
-            f'Length of "spatial_shape" should be 2, '
-            f"got {len(spatial_shape)} instead."
-        )
+        self.conv_type = conv_type
 
-        self.spatial_shape = spatial_shape
-        self.embed_dim = embed_dim
-        self.in_channels = in_channels
-        self.groups = embed_dim
+        if conv_type == "3d":
+            # Promote spatial_shape to 3D
+            if isinstance(spatial_shape, int):
+                spatial_shape = (spatial_shape,) * 3
+            elif len(spatial_shape) == 2:
+                spatial_shape = (spatial_shape[0],) * 3
 
-        if inference_mode:
-            self.reparam_conv = nn.Conv2d(
-                in_channels=self.in_channels,
-                out_channels=self.embed_dim,
-                kernel_size=self.spatial_shape,
-                stride=1,
-                padding=int(self.spatial_shape[0] // 2),
-                groups=self.embed_dim,
-                bias=True,
-            )
+            self.spatial_shape = spatial_shape
+            self.embed_dim = embed_dim
+            self.in_channels = in_channels
+            self.groups = embed_dim
+            padding = spatial_shape[0] // 2
+
+            if inference_mode:
+                self.reparam_conv = nn.Conv3d(
+                    in_channels, embed_dim, spatial_shape,
+                    stride=1, padding=padding, groups=embed_dim, bias=True,
+                )
+            else:
+                self.pe = nn.Conv3d(
+                    in_channels, embed_dim, spatial_shape,
+                    stride=1, padding=padding, bias=True, groups=embed_dim,
+                )
         else:
-            self.pe = nn.Conv2d(
-                in_channels,
-                embed_dim,
-                spatial_shape,
-                1,
-                int(spatial_shape[0] // 2),
-                bias=True,
-                groups=embed_dim,
+            if isinstance(spatial_shape, int):
+                spatial_shape = tuple([spatial_shape] * 2)
+            assert isinstance(spatial_shape, Tuple), (
+                f'"spatial_shape" must by a sequence or int, '
+                f"get {type(spatial_shape)} instead."
             )
+            assert len(spatial_shape) == 2, (
+                f'Length of "spatial_shape" should be 2, '
+                f"got {len(spatial_shape)} instead."
+            )
+
+            self.spatial_shape = spatial_shape
+            self.embed_dim = embed_dim
+            self.in_channels = in_channels
+            self.groups = embed_dim
+
+            if inference_mode:
+                self.reparam_conv = nn.Conv2d(
+                    in_channels=self.in_channels,
+                    out_channels=self.embed_dim,
+                    kernel_size=self.spatial_shape,
+                    stride=1,
+                    padding=int(self.spatial_shape[0] // 2),
+                    groups=self.embed_dim,
+                    bias=True,
+                )
+            else:
+                self.pe = nn.Conv2d(
+                    in_channels,
+                    embed_dim,
+                    spatial_shape,
+                    1,
+                    int(spatial_shape[0] // 2),
+                    bias=True,
+                    groups=embed_dim,
+                )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if hasattr(self, "reparam_conv"):
@@ -474,41 +604,63 @@ class RepCPE(nn.Module):
             return x
 
     def reparameterize(self) -> None:
-        # Build equivalent Id tensor
-        input_dim = self.in_channels // self.groups
-        kernel_value = torch.zeros(
-            (
-                self.in_channels,
-                input_dim,
-                self.spatial_shape[0],
-                self.spatial_shape[1],
-            ),
-            dtype=self.pe.weight.dtype,
-            device=self.pe.weight.device,
-        )
-        for i in range(self.in_channels):
-            kernel_value[
-                i,
-                i % input_dim,
-                self.spatial_shape[0] // 2,
-                self.spatial_shape[1] // 2,
-            ] = 1
-        id_tensor = kernel_value
+        if hasattr(self, "reparam_conv"):
+            return
 
-        # Reparameterize Id tensor and conv
-        w_final = id_tensor + self.pe.weight
-        b_final = self.pe.bias
+        if self.conv_type == "3d":
+            input_dim = self.in_channels // self.groups
+            kernel_value = torch.zeros(
+                (self.in_channels, input_dim, *self.spatial_shape),
+                dtype=self.pe.weight.dtype,
+                device=self.pe.weight.device,
+            )
+            c = self.spatial_shape[0] // 2
+            for i in range(self.in_channels):
+                kernel_value[i, i % input_dim, c, c, c] = 1
+            w_final = kernel_value + self.pe.weight
+            b_final = self.pe.bias
 
-        # Introduce reparam conv
-        self.reparam_conv = nn.Conv2d(
-            in_channels=self.in_channels,
-            out_channels=self.embed_dim,
-            kernel_size=self.spatial_shape,
-            stride=1,
-            padding=int(self.spatial_shape[0] // 2),
-            groups=self.embed_dim,
-            bias=True,
-        )
+            self.reparam_conv = nn.Conv3d(
+                in_channels=self.in_channels,
+                out_channels=self.embed_dim,
+                kernel_size=self.spatial_shape,
+                stride=1,
+                padding=int(self.spatial_shape[0] // 2),
+                groups=self.embed_dim,
+                bias=True,
+            )
+        else:
+            input_dim = self.in_channels // self.groups
+            kernel_value = torch.zeros(
+                (
+                    self.in_channels,
+                    input_dim,
+                    self.spatial_shape[0],
+                    self.spatial_shape[1],
+                ),
+                dtype=self.pe.weight.dtype,
+                device=self.pe.weight.device,
+            )
+            for i in range(self.in_channels):
+                kernel_value[
+                    i,
+                    i % input_dim,
+                    self.spatial_shape[0] // 2,
+                    self.spatial_shape[1] // 2,
+                ] = 1
+            w_final = kernel_value + self.pe.weight
+            b_final = self.pe.bias
+
+            self.reparam_conv = nn.Conv2d(
+                in_channels=self.in_channels,
+                out_channels=self.embed_dim,
+                kernel_size=self.spatial_shape,
+                stride=1,
+                padding=int(self.spatial_shape[0] // 2),
+                groups=self.embed_dim,
+                bias=True,
+            )
+
         self.reparam_conv.weight.data = w_final
         self.reparam_conv.bias.data = b_final
 
@@ -517,11 +669,16 @@ class RepCPE(nn.Module):
         self.__delattr__("pe")
 
 
+# ---------------------------------------------------------------------------
+# RepMixerBlock
+# ---------------------------------------------------------------------------
+
 class RepMixerBlock(nn.Module):
     """Implementation of Metaformer block with RepMixer as token mixer.
 
     For more details on Metaformer structure, please refer to:
-    `MetaFormer Is Actually What You Need for Vision <https://arxiv.org/pdf/2111.11418.pdf>`_
+    `MetaFormer Is Actually What You Need for Vision
+    <https://arxiv.org/pdf/2111.11418.pdf>`_
     """
 
     def __init__(
@@ -535,21 +692,8 @@ class RepMixerBlock(nn.Module):
         use_layer_scale: bool = True,
         layer_scale_init_value: float = 1e-5,
         inference_mode: bool = False,
+        conv_type: str = "2d",
     ):
-        """Build RepMixer Block.
-
-        Args:
-            dim: Number of embedding dimensions.
-            kernel_size: Kernel size for repmixer. Default: 3
-            mlp_ratio: MLP expansion ratio. Default: 4.0
-            act_layer: Activation layer. Default: ``nn.GELU``
-            drop: Dropout rate. Default: 0.0
-            drop_path: Drop path rate. Default: 0.0
-            use_layer_scale: Flag to turn on layer scale. Default: ``True``
-            layer_scale_init_value: Layer scale value at initialization. Default: 1e-5
-            inference_mode: Flag to instantiate block in inference mode. Default: ``False``
-        """
-
         super().__init__()
 
         self.token_mixer = RepMixer(
@@ -558,6 +702,7 @@ class RepMixerBlock(nn.Module):
             use_layer_scale=use_layer_scale,
             layer_scale_init_value=layer_scale_init_value,
             inference_mode=inference_mode,
+            conv_type=conv_type,
         )
 
         assert mlp_ratio > 0, "MLP ratio should be greater than 0, found: {}".format(
@@ -569,16 +714,16 @@ class RepMixerBlock(nn.Module):
             hidden_channels=mlp_hidden_dim,
             act_layer=act_layer,
             drop=drop,
+            conv_type=conv_type,
         )
 
-        # Drop Path
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-        # Layer Scale
         self.use_layer_scale = use_layer_scale
         if use_layer_scale:
             self.layer_scale = nn.Parameter(
-                layer_scale_init_value * torch.ones((dim, 1, 1)), requires_grad=True
+                layer_scale_init_value * torch.ones(_scale_shape(dim, conv_type)),
+                requires_grad=True,
             )
 
     def forward(self, x):
@@ -591,11 +736,16 @@ class RepMixerBlock(nn.Module):
         return x
 
 
+# ---------------------------------------------------------------------------
+# AttentionBlock
+# ---------------------------------------------------------------------------
+
 class AttentionBlock(nn.Module):
     """Implementation of metaformer block with MHSA as token mixer.
 
     For more details on Metaformer structure, please refer to:
-    `MetaFormer Is Actually What You Need for Vision <https://arxiv.org/pdf/2111.11418.pdf>`_
+    `MetaFormer Is Actually What You Need for Vision
+    <https://arxiv.org/pdf/2111.11418.pdf>`_
     """
 
     def __init__(
@@ -608,21 +758,13 @@ class AttentionBlock(nn.Module):
         drop_path: float = 0.0,
         use_layer_scale: bool = True,
         layer_scale_init_value: float = 1e-5,
+        conv_type: str = "2d",
     ):
-        """Build Attention Block.
-
-        Args:
-            dim: Number of embedding dimensions.
-            mlp_ratio: MLP expansion ratio. Default: 4.0
-            act_layer: Activation layer. Default: ``nn.GELU``
-            norm_layer: Normalization layer. Default: ``nn.BatchNorm2d``
-            drop: Dropout rate. Default: 0.0
-            drop_path: Drop path rate. Default: 0.0
-            use_layer_scale: Flag to turn on layer scale. Default: ``True``
-            layer_scale_init_value: Layer scale value at initialization. Default: 1e-5
-        """
-
         super().__init__()
+
+        # Override norm_layer for 3D if caller passed the 2D default
+        if conv_type == "3d" and norm_layer is nn.BatchNorm2d:
+            norm_layer = nn.BatchNorm3d
 
         self.norm = norm_layer(dim)
         self.token_mixer = MHSA(dim=dim)
@@ -636,19 +778,20 @@ class AttentionBlock(nn.Module):
             hidden_channels=mlp_hidden_dim,
             act_layer=act_layer,
             drop=drop,
+            conv_type=conv_type,
         )
 
-        # Drop path
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-        # Layer Scale
         self.use_layer_scale = use_layer_scale
         if use_layer_scale:
             self.layer_scale_1 = nn.Parameter(
-                layer_scale_init_value * torch.ones((dim, 1, 1)), requires_grad=True
+                layer_scale_init_value * torch.ones(_scale_shape(dim, conv_type)),
+                requires_grad=True,
             )
             self.layer_scale_2 = nn.Parameter(
-                layer_scale_init_value * torch.ones((dim, 1, 1)), requires_grad=True
+                layer_scale_init_value * torch.ones(_scale_shape(dim, conv_type)),
+                requires_grad=True,
             )
 
     def forward(self, x):
@@ -660,6 +803,10 @@ class AttentionBlock(nn.Module):
             x = x + self.drop_path(self.convffn(x))
         return x
 
+
+# ---------------------------------------------------------------------------
+# Stage builder
+# ---------------------------------------------------------------------------
 
 def basic_blocks(
     dim: int,
@@ -675,27 +822,9 @@ def basic_blocks(
     use_layer_scale: bool = True,
     layer_scale_init_value: float = 1e-5,
     inference_mode=False,
+    conv_type: str = "2d",
 ) -> nn.Sequential:
-    """Build FastViT blocks within a stage.
-
-    Args:
-        dim: Number of embedding dimensions.
-        block_index: block index.
-        num_blocks: List containing number of blocks per stage.
-        token_mixer_type: Token mixer type.
-        kernel_size: Kernel size for repmixer.
-        mlp_ratio: MLP expansion ratio.
-        act_layer: Activation layer.
-        norm_layer: Normalization layer.
-        drop_rate: Dropout rate.
-        drop_path_rate: Drop path rate.
-        use_layer_scale: Flag to turn on layer scale regularization.
-        layer_scale_init_value: Layer scale value at initialization.
-        inference_mode: Flag to instantiate block in inference mode.
-
-    Returns:
-        nn.Sequential object of all the blocks within the stage.
-    """
+    """Build FastViT blocks within a stage."""
     blocks = []
     for block_idx in range(num_blocks[block_index]):
         block_dpr = (
@@ -715,6 +844,7 @@ def basic_blocks(
                     use_layer_scale=use_layer_scale,
                     layer_scale_init_value=layer_scale_init_value,
                     inference_mode=inference_mode,
+                    conv_type=conv_type,
                 )
             )
         elif token_mixer_type == "attention":
@@ -728,6 +858,7 @@ def basic_blocks(
                     drop_path=block_dpr,
                     use_layer_scale=use_layer_scale,
                     layer_scale_init_value=layer_scale_init_value,
+                    conv_type=conv_type,
                 )
             )
         else:
@@ -739,9 +870,16 @@ def basic_blocks(
     return blocks
 
 
+# ---------------------------------------------------------------------------
+# FastViT
+# ---------------------------------------------------------------------------
+
 class FastViT(nn.Module):
     """
     This class implements `FastViT architecture <https://arxiv.org/pdf/2303.14189.pdf>`_
+
+    Supports both 2D images (conv_type='2d') and 3D voxels (conv_type='3d').
+    For 3D mode, the minimum supported input spatial size is 32×32×32.
     """
 
     def __init__(
@@ -767,20 +905,32 @@ class FastViT(nn.Module):
         pretrained=None,
         cls_ratio=2.0,
         inference_mode=False,
+        conv_type: str = "2d",
+        in_channels: int = 3,
         **kwargs,
     ) -> None:
 
         super().__init__()
 
+        if conv_type not in ("2d", "3d"):
+            raise ValueError(f"conv_type must be '2d' or '3d', got '{conv_type}'")
+
+        # Auto-promote norm_layer for 3D when the caller left the 2D default
+        if conv_type == "3d" and norm_layer is nn.BatchNorm2d:
+            norm_layer = nn.BatchNorm3d
+
         if not fork_feat:
             self.num_classes = num_classes
         self.fork_feat = fork_feat
+        self.conv_type = conv_type
 
         if pos_embs is None:
             pos_embs = [None] * len(layers)
 
         # Convolutional stem
-        self.patch_embed = convolutional_stem(3, embed_dims[0], inference_mode)
+        self.patch_embed = convolutional_stem(
+            in_channels, embed_dims[0], inference_mode, conv_type=conv_type
+        )
 
         # Build the main stages of the network architecture
         network = []
@@ -789,7 +939,10 @@ class FastViT(nn.Module):
             if pos_embs[i] is not None:
                 network.append(
                     pos_embs[i](
-                        embed_dims[i], embed_dims[i], inference_mode=inference_mode
+                        embed_dims[i],
+                        embed_dims[i],
+                        inference_mode=inference_mode,
+                        conv_type=conv_type,
                     )
                 )
             stage = basic_blocks(
@@ -806,6 +959,7 @@ class FastViT(nn.Module):
                 use_layer_scale=use_layer_scale,
                 layer_scale_init_value=layer_scale_init_value,
                 inference_mode=inference_mode,
+                conv_type=conv_type,
             )
             network.append(stage)
             if i >= len(layers) - 1:
@@ -820,6 +974,7 @@ class FastViT(nn.Module):
                         in_channels=embed_dims[i],
                         embed_dim=embed_dims[i + 1],
                         inference_mode=inference_mode,
+                        conv_type=conv_type,
                     )
                 )
 
@@ -831,9 +986,6 @@ class FastViT(nn.Module):
             self.out_indices = [0, 2, 4, 6]
             for i_emb, i_layer in enumerate(self.out_indices):
                 if i_emb == 0 and os.environ.get("FORK_LAST3", None):
-                    """For RetinaNet, `start_level=1`. The first norm layer will not used.
-                    cmd: `FORK_LAST3=1 python -m torch.distributed.launch ...`
-                    """
                     layer = nn.Identity()
                 else:
                     layer = norm_layer(embed_dims[i_emb])
@@ -841,18 +993,32 @@ class FastViT(nn.Module):
                 self.add_module(layer_name, layer)
         else:
             # Classifier head
-            self.gap = nn.AdaptiveAvgPool2d(output_size=1)
-            self.conv_exp = MobileOneBlock(
-                in_channels=embed_dims[-1],
-                out_channels=int(embed_dims[-1] * cls_ratio),
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                groups=embed_dims[-1],
-                inference_mode=inference_mode,
-                use_se=True,
-                num_conv_branches=1,
-            )
+            Pool = _get_pool(conv_type)
+            self.gap = Pool(output_size=1)
+
+            if conv_type == "3d":
+                exp_ch = int(embed_dims[-1] * cls_ratio)
+                self.conv_exp = nn.Sequential(
+                    nn.Conv3d(
+                        embed_dims[-1], exp_ch, kernel_size=3, stride=1, padding=1,
+                        groups=embed_dims[-1], bias=False,
+                    ),
+                    nn.BatchNorm3d(exp_ch),
+                    nn.GELU(),
+                )
+            else:
+                self.conv_exp = MobileOneBlock(
+                    in_channels=embed_dims[-1],
+                    out_channels=int(embed_dims[-1] * cls_ratio),
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    groups=embed_dims[-1],
+                    inference_mode=inference_mode,
+                    use_se=True,
+                    num_conv_branches=1,
+                )
+
             self.head = (
                 nn.Linear(int(embed_dims[-1] * cls_ratio), num_classes)
                 if num_classes > 0
@@ -917,7 +1083,7 @@ class FastViT(nn.Module):
 
             sterile_dict = FastViT._scrub_checkpoint(_state_dict, self)
             state_dict = sterile_dict
-            missing_keys, unexpected_keys = self.load_state_dict(state_dict, False)
+            self.load_state_dict(state_dict, False)
 
     def forward_embeddings(self, x: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(x)
@@ -932,26 +1098,24 @@ class FastViT(nn.Module):
                 x_out = norm_layer(x)
                 outs.append(x_out)
         if self.fork_feat:
-            # output the features of four stages for dense prediction
             return outs
-        # output only the features of last layer for image classification
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # input embedding
         x = self.forward_embeddings(x)
-        # through backbone
         x = self.forward_tokens(x)
         if self.fork_feat:
-            # output features of four stages for dense prediction
             return x
-        # for image classification
         x = self.conv_exp(x)
         x = self.gap(x)
         x = x.view(x.size(0), -1)
         cls_out = self.head(x)
         return cls_out
 
+
+# ---------------------------------------------------------------------------
+# Model variants
+# ---------------------------------------------------------------------------
 
 @register_model
 def fastvit_t8(pretrained=False, **kwargs):
