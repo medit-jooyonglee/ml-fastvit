@@ -101,6 +101,7 @@ def convolutional_stem(
     out_channels: int,
     inference_mode: bool = False,
     conv_type: str = "2d",
+    f_maps=None,
 ) -> nn.Sequential:
     """Build convolutional stem.
 
@@ -108,14 +109,19 @@ def convolutional_stem(
     For 3D uses plain Conv3d+BN+GELU blocks.
     """
     if conv_type == "3d":
+        f_maps = f_maps or [1, 1, 1]
         Conv = nn.Conv3d
         BN = nn.BatchNorm3d
+        ch1, ch2, _ = [int(out_channels * f) for f in f_maps]
         return nn.Sequential(
-            Conv(in_channels, out_channels, 3, stride=2, padding=1, bias=False),
-            BN(out_channels),
+            Conv(in_channels, ch1, 3, stride=2, padding=1, bias=False),
+            BN(ch1),
             nn.GELU(),
-            Conv(out_channels, out_channels, 3, stride=2, padding=1,
-                 groups=out_channels, bias=False),
+            Conv(ch1, ch2, 3, stride=2, padding=1,
+                 groups=ch1, bias=False),
+            BN(ch2),
+            nn.GELU(),
+            Conv(ch2, out_channels, 1, bias=False),
             BN(out_channels),
             nn.GELU(),
             Conv(out_channels, out_channels, 1, bias=False),
@@ -235,12 +241,14 @@ class PatchEmbed(nn.Module):
         super().__init__()
 
         if conv_type == "3d":
+            from math import gcd
             Conv = nn.Conv3d
             BN = nn.BatchNorm3d
             padding = patch_size // 2
+            dw_groups = gcd(in_channels, embed_dim)
             self.proj = nn.Sequential(
                 Conv(in_channels, embed_dim, patch_size, stride=stride,
-                     padding=padding, groups=in_channels, bias=False),
+                     padding=padding, groups=dw_groups, bias=False),
                 BN(embed_dim),
                 nn.GELU(),
                 Conv(embed_dim, embed_dim, 1, bias=False),
@@ -430,9 +438,9 @@ class RepMixer(nn.Module):
             id_tensor[i, i % input_dim, c, c, c] = 1
 
         if self.use_layer_scale:
-            ls = self.layer_scale  # shape (dim, 1, 1, 1)
+            ls = self.layer_scale.unsqueeze(-1)  # (dim, 1, 1, 1) → (dim, 1, 1, 1, 1)
             w = id_tensor + ls * (w_mixer - w_norm)
-            b = ls.view(-1) * (b_mixer - b_norm)
+            b = self.layer_scale.view(-1) * (b_mixer - b_norm)
         else:
             w = id_tensor + w_mixer - w_norm
             b = b_mixer - b_norm
@@ -907,6 +915,7 @@ class FastViT(nn.Module):
         inference_mode=False,
         conv_type: str = "2d",
         in_channels: int = 3,
+        f_maps=None,
         **kwargs,
     ) -> None:
 
@@ -929,7 +938,9 @@ class FastViT(nn.Module):
 
         # Convolutional stem
         self.patch_embed = convolutional_stem(
-            in_channels, embed_dims[0], inference_mode, conv_type=conv_type
+            in_channels, embed_dims[0], inference_mode, conv_type=conv_type,
+            f_maps=f_maps
+            
         )
 
         # Build the main stages of the network architecture
@@ -1205,6 +1216,44 @@ def fastvit_sa12(pretrained=False, **kwargs):
     if pretrained:
         raise ValueError("Functionality not implemented.")
     return model
+
+
+
+@register_model
+def fastvit_mysa(pretrained=False,
+    layers = [2, 2, 4, 2],
+    embed_dims = [64, 128, 256, 512],
+    mlp_ratios = [4, 4, 4, 4] ,
+    downsamples = [False, False, True, True],
+    spaital_shape = (3, 3, 3),
+    token_mixers = ("repmixer", "repmixer", "repmixer", "attention"),
+                 **kwargs):
+    """Instantiate FastViT-SA08 model variant."""
+
+    # spaital_shape = kwargs.get('spatial_shape', (3, 3, 3))
+    pos_embs = [None, None, None, partial(RepCPE, spatial_shape=spaital_shape)]
+    
+    model = FastViT(
+        layers,
+        token_mixers=token_mixers,
+        embed_dims=embed_dims,
+        pos_embs=pos_embs,
+        mlp_ratios=mlp_ratios,
+        downsamples=downsamples,
+        **kwargs,
+    )
+    model.default_cfg = default_cfgs["fastvit_s"]
+    if pretrained:
+        raise ValueError("Functionality not implemented.")
+    return model
+
+
+
+
+
+
+
+
 
 
 @register_model
