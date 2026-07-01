@@ -1112,8 +1112,9 @@ class FastViT(nn.Module):
         if self.fork_feat:
             return outs
         return x
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    
+    def get_head_embedding(self, x) -> torch.Tensor:
+        
         x = self.forward_embeddings(x)
         x = self.forward_tokens(x)
         if self.fork_feat:
@@ -1122,6 +1123,19 @@ class FastViT(nn.Module):
         x = self.gap(x)
         self.head_embedding = x
         x = x.view(x.size(0), -1)
+        return x
+        
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x = self.forward_embeddings(x)
+        # x = self.forward_tokens(x)
+        # if self.fork_feat:
+        #     return x
+        # x = self.conv_exp(x)
+        # x = self.gap(x)
+        # self.head_embedding = x
+        # x = x.view(x.size(0), -1)
+        x = self.get_head_embedding(x)
         cls_out = self.head(x)
         return cls_out
     
@@ -1136,6 +1150,75 @@ class FastViT(nn.Module):
             return torch.flatten(self.head_embedding, 1)
         else:
             return None
+
+
+## distillation-fast-vit
+
+class DistilledFastViT(nn.Module):
+    """Distilled FastViT model with an additional distillation head."""
+
+    def __init__(self, *, params, **kwargs):
+        super().__init__()
+        from trainer import get_model
+        
+        num_classes = params.get("num_classes", 1000)
+        self.model =  get_model(params)
+        embed_dims = params.get("embed_dims",None)
+        cls_ratio = params.get("cls_ratio", 2.0)
+        distilllation_channels = kwargs.get("distillation_channels", None) or num_classes
+        
+        
+        self.distillation_head = nn.Linear(int(embed_dims[-1] * cls_ratio), distilllation_channels)
+
+    def forward_distillation(self, x: torch.Tensor) -> torch.Tensor:
+        model = self.model # =  get_model(params)
+        # x = model.forward_embeddings(x)
+        # x = model.forward_tokens(x)
+        # if model.fork_feat:
+        #     return x
+        # x = self.conv_exp(x)
+        # x = self.gap(x)
+        # self.head_embedding = x
+        # x = x.view(x.size(0), -1)
+        x0 = model.get_head_embedding(x)
+        cls_out = model.head(x0)
+        dist_out = self.distillation_head(x0)
+        return cls_out, dist_out
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        cls_out, dist_out = self.forward_distillation(x)
+        return cls_out, dist_out
+    
+    
+class DistilledModel(nn.Module):
+    def __init__(self, *, teacher_params, student_params, tearcher_predtrained_model='', **kwargs):
+        super().__init__()
+        from trainer import get_model, utils
+        self.teacher = get_model(teacher_params)
+        self.teacher.eval()  # Set teacher model to evaluation mode
+        for param in self.teacher.parameters():
+            param.requires_grad = False
+        # if os.path.exists(tearcher_predtrained_model):
+            # utils.load_checkpoint(self.teacher, tearcher_predtrained_model)
+
+        self.student_distillation = get_model(student_params)
+        
+    def get_embedding(self, x):
+        get_embedding = getattr(self.student_distillation, 'get_embedding', None)
+        if callable(get_embedding):
+            return self.student_distillation.get_embedding(x)
+        else:
+            return None
+        
+        
+    def forward(self, x):
+        
+        with torch.no_grad():
+            teacher_output = self.teacher(x)
+            
+        cls_out, dist_out = self.student_distillation(x)
+        
+        return cls_out, dist_out, teacher_output
 
 
 # ---------------------------------------------------------------------------
