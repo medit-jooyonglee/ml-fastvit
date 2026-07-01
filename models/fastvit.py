@@ -1039,6 +1039,7 @@ class FastViT(nn.Module):
         self.apply(self.cls_init_weights)
         self.init_cfg = copy.deepcopy(init_cfg)
 
+        self.head_embedding: torch.Tensor = None
         # load pre-trained model
         if self.fork_feat and (self.init_cfg is not None or pretrained is not None):
             self.init_weights()
@@ -1119,9 +1120,22 @@ class FastViT(nn.Module):
             return x
         x = self.conv_exp(x)
         x = self.gap(x)
+        self.head_embedding = x
         x = x.view(x.size(0), -1)
         cls_out = self.head(x)
         return cls_out
+    
+    
+    def get_embedding(self) -> torch.Tensor:
+        """Get embeddings from the model."""
+        # x = self.forward_embeddings(x)
+        # x = self.forward_tokens(x)
+        # if self.head_embedding:
+            # return self.head_embedding
+        if self.head_embedding is not None:
+            return torch.flatten(self.head_embedding, 1)
+        else:
+            return None
 
 
 # ---------------------------------------------------------------------------
