@@ -184,14 +184,17 @@ class MHSA(nn.Module):
         qkv_bias: bool = False,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
+        used_distillation:bool = False
     ) -> None:
         super().__init__()
         assert dim % head_dim == 0, "dim should be divisible by head_dim"
         self.head_dim = head_dim
         self.num_heads = dim // head_dim
         self.scale = head_dim**-0.5
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim)) if used_distillation else None
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        # add_dim = 1 if used_distillation else 0
+        self.qkv = nn.Linear(dim , dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -204,6 +207,13 @@ class MHSA(nn.Module):
             N *= s
 
         x_flat = torch.flatten(x, start_dim=2).transpose(-2, -1)  # (B, N, C)
+        # x_flat = x_flat + self.cls_token.expand(B, -1, -1) if self.cls_token is not None else x_flat
+        if self.cls_token is not None:
+            cls_token_expanded = self.cls_token.expand(B, -1, -1)
+            x_flat = torch.cat((cls_token_expanded, x_flat), dim=1)  # (B, N+1, C)
+            N += 1
+            # N += 1  # Update N to account for the added class token
+        # self.cls_token = self.cls_token.expand(B, -1, -1) if self.cls_token is not None else None
         qkv = (
             self.qkv(x_flat)
             .reshape(B, N, 3, self.num_heads, self.head_dim)
@@ -219,6 +229,7 @@ class MHSA(nn.Module):
         x_out = self.proj(x_out)
         x_out = self.proj_drop(x_out)
         x_out = x_out.transpose(-2, -1).reshape(shape)
+        # x_out = x_out.transpose(-2, -1)
         return x_out
 
 
@@ -767,6 +778,7 @@ class AttentionBlock(nn.Module):
         use_layer_scale: bool = True,
         layer_scale_init_value: float = 1e-5,
         conv_type: str = "2d",
+        used_distillation=False
     ):
         super().__init__()
 
@@ -775,7 +787,7 @@ class AttentionBlock(nn.Module):
             norm_layer = nn.BatchNorm3d
 
         self.norm = norm_layer(dim)
-        self.token_mixer = MHSA(dim=dim)
+        self.token_mixer = MHSA(dim=dim, used_distillation=used_distillation)
 
         assert mlp_ratio > 0, "MLP ratio should be greater than 0, found: {}".format(
             mlp_ratio
@@ -831,6 +843,8 @@ def basic_blocks(
     layer_scale_init_value: float = 1e-5,
     inference_mode=False,
     conv_type: str = "2d",
+    used_distillation: bool = False,
+    **kwargs
 ) -> nn.Sequential:
     """Build FastViT blocks within a stage."""
     blocks = []
@@ -867,6 +881,7 @@ def basic_blocks(
                     use_layer_scale=use_layer_scale,
                     layer_scale_init_value=layer_scale_init_value,
                     conv_type=conv_type,
+                    used_distillation=used_distillation
                 )
             )
         else:
@@ -916,6 +931,7 @@ class FastViT(nn.Module):
         conv_type: str = "2d",
         in_channels: int = 3,
         f_maps=None,
+        used_distillation=False,
         **kwargs,
     ) -> None:
 
@@ -971,6 +987,7 @@ class FastViT(nn.Module):
                 layer_scale_init_value=layer_scale_init_value,
                 inference_mode=inference_mode,
                 conv_type=conv_type,
+                used_distillation=used_distillation,
             )
             network.append(stage)
             if i >= len(layers) - 1:
