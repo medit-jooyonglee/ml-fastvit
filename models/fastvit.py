@@ -102,22 +102,26 @@ def convolutional_stem(
     inference_mode: bool = False,
     conv_type: str = "2d",
     f_maps=None,
+    stem_strides=[2, 2],
+    stem_kernel_size=[3, 3]
 ) -> nn.Sequential:
     """Build convolutional stem.
 
     For 2D uses MobileOneBlock (with structural reparameterization).
     For 3D uses plain Conv3d+BN+GELU blocks.
     """
+    stride0, stride1 = stem_strides
+    kenrel0, kernel1 = stem_kernel_size
     if conv_type == "3d":
         f_maps = f_maps or [1, 1, 1]
         Conv = nn.Conv3d
         BN = nn.BatchNorm3d
         ch1, ch2, _ = [int(out_channels * f) for f in f_maps]
         return nn.Sequential(
-            Conv(in_channels, ch1, 3, stride=2, padding=1, bias=False),
+            Conv(in_channels, ch1, kenrel0, stride=stride0, padding=1, bias=False),
             BN(ch1),
             nn.GELU(),
-            Conv(ch1, ch2, 3, stride=2, padding=1,
+            Conv(ch1, ch2, kernel1, stride=stride1, padding=1,
                  groups=ch1, bias=False),
             BN(ch2),
             nn.GELU(),
@@ -570,6 +574,7 @@ class RepCPE(nn.Module):
                 self.reparam_conv = nn.Conv3d(
                     in_channels, embed_dim, spatial_shape,
                     stride=1, padding=padding, groups=embed_dim, bias=True,
+                    
                 )
             else:
                 self.pe = nn.Conv3d(
@@ -932,6 +937,8 @@ class FastViT(nn.Module):
         in_channels: int = 3,
         f_maps=None,
         used_distillation=False,
+        stem_strides=[2, 2],
+        # spatial_shape=None,
         **kwargs,
     ) -> None:
 
@@ -955,10 +962,10 @@ class FastViT(nn.Module):
         # Convolutional stem
         self.patch_embed = convolutional_stem(
             in_channels, embed_dims[0], inference_mode, conv_type=conv_type,
-            f_maps=f_maps
+            f_maps=f_maps, stem_strides=stem_strides
             
         )
-
+        spatial_shape = kwargs.get("spatial_shape", None)
         # Build the main stages of the network architecture
         network = []
         for i in range(len(layers)):
@@ -970,6 +977,7 @@ class FastViT(nn.Module):
                         embed_dims[i],
                         inference_mode=inference_mode,
                         conv_type=conv_type,
+                        # spatial_shape=spatial_shape
                     )
                 )
             stage = basic_blocks(
@@ -1339,13 +1347,16 @@ def fastvit_mysa(pretrained=False,
     embed_dims = [64, 128, 256, 512],
     mlp_ratios = [4, 4, 4, 4] ,
     downsamples = [False, False, True, True],
-    spaital_shape = (3, 3, 3),
+    spatial_shape = (3, 3, 3),
     token_mixers = ("repmixer", "repmixer", "repmixer", "attention"),
                  **kwargs):
     """Instantiate FastViT-SA08 model variant."""
-
+    pos_embs = [None,] * (len(layers) - 1) + [
+        partial(RepCPE, spatial_shape=spatial_shape)
+    ]
+    # len(layers)
     # spaital_shape = kwargs.get('spatial_shape', (3, 3, 3))
-    pos_embs = [None, None, None, partial(RepCPE, spatial_shape=spaital_shape)]
+    # pos_embs = [None, None, None, ]
     
     model = FastViT(
         layers,
